@@ -1,6 +1,6 @@
 import os, re, requests, threading, queue
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from datetime import datetime
@@ -191,9 +191,24 @@ log.info("Download folder", downloads_folder)
 
 def process_link(link_info):
     link, position = link_info
-    log.info(f"Started Processing", f"{link[:30]}...{link[60:]}")
+    
+    # URL-encode path to avoid UnicodeEncodeError in requests (e.g. for en-dash '–')
     try:
-        response = requests.get(link, headers=headers)
+        parsed = urlparse(link)
+        safe_path = quote(parsed.path)
+        safe_query = quote(parsed.query, safe='=&')
+        safe_fragment = quote(parsed.fragment)
+        safe_link = f"{parsed.scheme}://{parsed.netloc}{safe_path}"
+        if safe_query:
+            safe_link += f"?{safe_query}"
+        if safe_fragment:
+            safe_link += f"#{safe_fragment}"
+    except Exception:
+        safe_link = link
+
+    log.info(f"Started Processing", f"{safe_link[:30]}...{safe_link[60:]}")
+    try:
+        response = requests.get(safe_link, headers=headers)
     except Exception as e:
         log.error("Failed to connect to page", str(e))
         return
@@ -203,13 +218,21 @@ def process_link(link_info):
         return
 
     soup = BeautifulSoup(response.text, 'html.parser')
-    parsed_url = urlparse(link)
+    parsed_url = urlparse(safe_link)
     
     if "datanodes.to" in parsed_url.netloc:
         file_name = os.path.basename(parsed_url.path)
         if not file_name:
             file_name = "default_file_name"
             
+        # Robust extraction of DataNodes parameters
+        code = ""
+        rand = ""
+        referer = ""
+        free_method = ""
+        premium_method = ""
+        countdown_secs = 5
+        
         countdown_tag = soup.find('download-countdown')
         if countdown_tag:
             code = countdown_tag.get('code', '')
@@ -217,13 +240,37 @@ def process_link(link_info):
             referer = countdown_tag.get('referer', '')
             free_method = countdown_tag.get('free-method', '')
             premium_method = countdown_tag.get('premium-method', '')
-            
-            # Wait for countdown
             try:
                 countdown_secs = int(countdown_tag.get(':countdown', '5'))
             except ValueError:
                 countdown_secs = 5
-                
+        else:
+            # Fallback: extract from form inputs
+            form = soup.find('form', id='downloadForm') or soup.find('form')
+            if form:
+                id_input = form.find('input', {'name': 'id'})
+                if id_input:
+                    code = id_input.get('value', '')
+                rand_input = form.find('input', {'name': 'rand'})
+                if rand_input:
+                    rand = rand_input.get('value', '')
+                referer_input = form.find('input', {'name': 'referer'})
+                if referer_input:
+                    referer = referer_input.get('value', '')
+                method_free_input = form.find('input', {'name': 'method_free'}) or form.find('button', {'name': 'method_free'})
+                if method_free_input:
+                    free_method = method_free_input.get('value', '')
+                method_premium_input = form.find('input', {'name': 'method_premium'})
+                if method_premium_input:
+                    premium_method = method_premium_input.get('value', '')
+
+        # If code is still not found, try to extract from URL path
+        if not code:
+            path_segments = [s for s in parsed_url.path.split('/') if s]
+            if path_segments:
+                code = path_segments[0]
+
+        if code:
             log.info(f"Waiting countdown for {file_name[:25]}", f"{countdown_secs}s")
             import time
             time.sleep(countdown_secs)
@@ -238,11 +285,11 @@ def process_link(link_info):
                 'g_captch__a': '1'
             }
             post_headers = headers.copy()
-            post_headers['referer'] = link
+            post_headers['referer'] = safe_link
             post_headers['x-requested-with'] = 'XMLHttpRequest'
             
             try:
-                post_response = requests.post(link, data=data, headers=post_headers)
+                post_response = requests.post(safe_link, data=data, headers=post_headers)
                 if post_response.status_code == 200:
                     res_json = post_response.json()
                     if res_json and 'url' in res_json:
@@ -261,7 +308,7 @@ def process_link(link_info):
             except Exception as e:
                 log.error("Error occurred while getting DataNodes link", str(e))
         else:
-            log.error("Download countdown element not found on page", response.status_code)
+            log.error("Failed to resolve DataNodes file code from page or URL", response.status_code)
     else:
         # FuckingFast
         meta_title = soup.find('meta', attrs={'name': 'title'})
